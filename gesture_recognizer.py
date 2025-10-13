@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import math
 
 class GestureRecognizer:
     def __init__(self):
@@ -38,3 +39,43 @@ class GestureRecognizer:
         y = int(index_finger_tip.y * frame_height)
 
         return (x,y) 
+    
+    def get_gesture(self):
+        if not self.landmarks:
+            return "UNKNOWN"
+        
+        hand_landmarks = self.landmarks.landmark
+
+        wrist_pt = hand_landmarks[0]
+        mcp_middlefinger_base_pt = hand_landmarks[9]
+
+        hand_scale = math.hypot(wrist_pt.x - mcp_middlefinger_base_pt.x, wrist_pt.y - mcp_middlefinger_base_pt.y)
+
+        if hand_scale == 0:
+            return "UNKNOWN"
+
+        fingertip_indices = [8,12,16,20]
+        total_normalized_distance = 0
+        raw_distance = 0
+        for i in fingertip_indices:
+            finger_pt = hand_landmarks[i]
+
+            raw_distance += math.hypot(wrist_pt.x - finger_pt.x, wrist_pt.y - finger_pt.y)
+            
+            normalized_distance = raw_distance / hand_scale
+            total_normalized_distance += normalized_distance
+        
+        avg_normalized_distance = total_normalized_distance / len(fingertip_indices)   
+        print(f"Finger landmark position from wrist:{avg_normalized_distance}")
+
+        FIST_THRESHOLD = 4.45
+        OPEN_HAND_THRESHOLD = 1.65
+
+        if avg_normalized_distance < 3.82 and avg_normalized_distance > 3.75:
+            gesture_name = "OPEN"
+        elif avg_normalized_distance < 1.85 and avg_normalized_distance > 1.75:
+            gesture_name = "CLOSE"
+        else: 
+            gesture_name = "UNKNOWN"
+
+        return gesture_name      
