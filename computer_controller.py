@@ -14,4 +14,4 @@ class ComputerController:
 
     def point_movement(self, x_coord, y_coord):
         pyautogui.moveTo(x_coord, y_coord)
-        print(f"Pointer location: {x_coord, y_coord}")
+        # print(f"Pointer location: {x_coord, y_coord}")
