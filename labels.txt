@@ -1,0 +1,3 @@
+0 Pointer
+1 Left_Click
+2 Right_Click

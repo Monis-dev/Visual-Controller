@@ -1,43 +1,34 @@
 import cv2
 import mediapipe as mp
 import math
-from utils import Utils
-
-utils = Utils()
+from collections import deque
 
 class GestureRecognizer:
     def __init__(self):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
-            static_image_mode=False,        # CRITICAL: Must be False for video
-            max_num_hands=1,                # Only track 1 hand (faster)
-            min_detection_confidence=0.5,   # Lower = faster detection
-            min_tracking_confidence=0.5,    # Lower = faster tracking
-            model_complexity=0 )
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7,
+            model_complexity=0
+        )
         self.mp_drawing = mp.solutions.drawing_utils
         self.landmarks = None
+        
+        # Gesture smoothing with deque for better performance
+        self.gesture_buffer = deque(maxlen=7)
+        self.last_stable_gesture = "IDLE"
 
     def find_hand_landmarks(self, frame):
         self.landmarks = None
         
-        frame = cv2.flip (frame, 1)
+        frame = cv2.flip(frame, 1)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb_frame)
 
         if results.multi_hand_landmarks:
             hand_landmarks = results.multi_hand_landmarks[0]
-
-            # smoothed_list = []
-            # for i, lm in enumerate(hand_landmarks.landmark):
-            #     pre_x, prev_y = self.smoothed_landmarks[i]
-            #     smooth_x = utils.lerp(pre_x, lm.x, 0.3)
-            #     smooth_y = utils.lerp(prev_y, lm.y, 0.3)
-            #     smoothed_list.append((smooth_x, smooth_y))
-
-            #     lm.x = smooth_x
-            #     lm.y = smooth_y
-
-            # self.smoothed_landmarks = smoothed_list    
             self.landmarks = hand_landmarks
             self.mp_drawing.draw_landmarks(
                 frame,
@@ -47,88 +38,197 @@ class GestureRecognizer:
 
         return frame, self.landmarks
     
-    def get_pointer_coordinates(self, frame_shape):
+    def _get_distance(self, point1, point2):
+        """Calculate Euclidean distance between two points"""
+        return math.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2)
+    
+    def _get_angle(self, point1, point2, point3):
+        """Calculate angle at point2 formed by point1-point2-point3"""
+        radians = math.atan2(point3.y - point2.y, point3.x - point2.x) - \
+                  math.atan2(point1.y - point2.y, point1.x - point2.x)
+        angle = abs(math.degrees(radians))
+        return angle if angle <= 180 else 360 - angle
+    
+    def _is_finger_extended(self, finger_name):
+        """
+        Check if a finger is extended using multiple criteria.
+        """
         if not self.landmarks:
-            return None
+            return False
+        
+        lm = self.landmarks.landmark
+        
+        fingers = {
+            'thumb': [1, 2, 3, 4],
+            'index': [5, 6, 7, 8],
+            'middle': [9, 10, 11, 12],
+            'ring': [13, 14, 15, 16],
+            'pinky': [17, 18, 19, 20]
+        }
+        
+        if finger_name not in fingers:
+            return False
+        
+        indices = fingers[finger_name]
+        mcp, pip, dip, tip = [lm[i] for i in indices]
+        wrist = lm[0]
+        
+        tip_to_wrist = self._get_distance(tip, wrist)
+        pip_to_wrist = self._get_distance(pip, wrist)
+        angle = self._get_angle(mcp, pip, tip)
+        
+        if finger_name == 'thumb':
+            index_mcp = lm[5]
+            thumb_extended = self._get_distance(tip, index_mcp) > self._get_distance(pip, index_mcp) * 1.1
+            return thumb_extended and angle > 120
+        
+        is_extended = (
+            tip_to_wrist > pip_to_wrist and
+            angle > 140
+        )
+        
+        return is_extended
+    
+    def _count_extended_fingers(self):
+        """Count how many fingers are extended"""
+        if not self.landmarks:
+            return 0
+        
+        fingers = ['thumb', 'index', 'middle', 'ring', 'pinky']
+        extended_count = sum(1 for finger in fingers if self._is_finger_extended(finger))
+        
+        return extended_count
+    
+    def _get_finger_states(self):
+        """Get detailed state of each finger"""
+        fingers = ['thumb', 'index', 'middle', 'ring', 'pinky']
+        return {finger: self._is_finger_extended(finger) for finger in fingers}
+    
+    def get_gesture(self):
+        """
+        Recognize gesture based on finger states with high accuracy.
+        The order of checks is important for prioritizing specific gestures.
+        """
+        if not self.landmarks:
+            return "UNKNOWN", 0.0
+        
+        # Get finger states and counts
+        finger_states = self._get_finger_states()
+        extended_count = sum(finger_states.values())
+        lm = self.landmarks.landmark
+
+        gesture = "IDLE"
+        confidence = 0.0
+        
+        # <<< --- NEW: PINCH GESTURE DETECTION --- >>>
+        # High-priority check for a pinch gesture (thumb tip and index tip are close)
+        thumb_tip = lm[self.mp_hands.HandLandmark.THUMB_TIP]
+        index_tip = lm[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        pinch_distance = self._get_distance(thumb_tip, index_tip)
+        
+        # This threshold is based on normalized coordinates and may need tuning.
+        # A smaller value means the fingers must be closer.
+        pinch_threshold = 0.045
+
+        # Condition: Thumb and index are close, and other fingers are not fully extended
+        if (pinch_distance < pinch_threshold and 
+            not finger_states['middle'] and 
+            not finger_states['ring'] and 
+            not finger_states['pinky']):
+            gesture = "PINCH"
+            # Confidence is higher the closer the pinch
+            confidence = max(0.0, 1.0 - (pinch_distance / pinch_threshold))
+
+        # FIST / CLOSE: All fingers curled
+        elif extended_count == 0:
+            gesture = "CLOSE"
+            confidence = 1.0
+        
+        # ONE FINGER (INDEX POINTING): Only index extended
+        elif extended_count == 1 and finger_states['index']:
+            gesture = "POINTING"
+            confidence = 1.0
+        
+        # TWO FINGERS: Index and middle extended (Victory/Peace sign)
+        elif (extended_count == 2 and 
+              finger_states['index'] and finger_states['middle']):
+            gesture = "POINTING"  # Treat as pointing for cursor control
+            confidence = 0.9
+        
+        # OPEN HAND: 4 or 5 fingers extended
+        elif extended_count >= 4:
+            gesture = "OPEN"
+            confidence = extended_count / 5.0
+        
+        # --- Other cases fall back to IDLE ---
+        else:
+            gesture = "IDLE"
+            confidence = 0.4 # Default low confidence
+        
+        # Add to buffer for temporal smoothing
+        self.gesture_buffer.append(gesture)
+        
+        # Determine the most stable gesture from the buffer
+        if len(self.gesture_buffer) == self.gesture_buffer.maxlen:
+            # Count occurrences of each gesture in the buffer
+            most_common = max(set(self.gesture_buffer), key=self.gesture_buffer.count)
+            stability = self.gesture_buffer.count(most_common) / self.gesture_buffer.maxlen
+            
+            # Only update the stable gesture if a new one is consistently detected
+            if stability > 0.6:  # Over 60% of recent frames agree
+                self.last_stable_gesture = most_common
+        
+        # Return the last known stable gesture to prevent flickering
+        return self.last_stable_gesture, confidence
+    
+    def get_pointer_coordinates(self, frame_shape):
+        """
+        Get pointer coordinates. Returns valid coordinates for 'POINTING' and 'PINCH'.
+        For PINCH, it returns the midpoint of the thumb and index finger for stability.
+        """
+        if not self.landmarks:
+            return None, None, None
         
         hand_landmarks = self.landmarks.landmark
         frame_height, frame_width, _ = frame_shape
 
-        index_finger_tip = hand_landmarks[8]
-        middle_finger_tip = hand_landmarks[12]
-
-        index_finger_dip = hand_landmarks[7]
-        middle_finger_dip = hand_landmarks[11]
-        ring_finger_tip = hand_landmarks[16]
-        pinky_finger_tip = hand_landmarks[20]
-
-        gesture_name, avg_normalized_distance = self.get_gesture()  
-
-        x = int(index_finger_tip.x * frame_width)
-        y = int(index_finger_tip.y * frame_height)
+        gesture_name, confidence = self.get_gesture()
         
-        if avg_normalized_distance < 8.59 and avg_normalized_distance > 3.00:
-            return (x,y), frame_width, frame_height
+        # Default to no coordinates
+        coords = None
+
+        # --- THIS IS THE KEY CHANGE ---
+        # Allow cursor movement for both POINTING and PINCH gestures
+        if gesture_name in ["POINTING", "PINCH"]:
+            if gesture_name == "PINCH":
+                # For pinch, use the midpoint between thumb and index for stability
+                thumb_tip = hand_landmarks[self.mp_hands.HandLandmark.THUMB_TIP]
+                index_tip = hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                mid_x = (thumb_tip.x + index_tip.x) / 2
+                mid_y = (thumb_tip.y + index_tip.y) / 2
+                x = int(mid_x * frame_width)
+                y = int(mid_y * frame_height)
+                coords = (x, y)
+            else: # POINTING
+                # Use index finger tip for pointing
+                index_finger_tip = hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                x = int(index_finger_tip.x * frame_width)
+                y = int(index_finger_tip.y * frame_height)
+                coords = (x, y)
         
-        return None, frame_width, frame_height
-    def get_gesture(self):
+        return coords, frame_width, frame_height
+    
+    def get_debug_info(self):
+        """Get debug information about finger states"""
         if not self.landmarks:
-            return "UNKNOWN"
+            return "No hand detected"
         
-        hand_landmarks = self.landmarks.landmark
-
-        wrist_pt = hand_landmarks[0]
-        mcp_middlefinger_base_pt = hand_landmarks[9]
-
-        hand_scale = math.hypot(wrist_pt.x - mcp_middlefinger_base_pt.x, wrist_pt.y - mcp_middlefinger_base_pt.y)
-
-        if hand_scale == 0:
-            return "UNKNOWN"
-
-        fingertip_indices = [8,12,16,20]
-        total_normalized_distance = 0
-        raw_distance = 0
-        for i in fingertip_indices:
-            finger_pt = hand_landmarks[i]
-
-            raw_distance = self._calculate_angle(wrist_pt, mcp_middlefinger_base_pt, finger_pt)           
-            normalized_distance = raw_distance / hand_scale
-            total_normalized_distance += normalized_distance / 100 
+        finger_states = self._get_finger_states()
+        extended_count = sum(finger_states.values())
         
-        avg_normalized_distance = total_normalized_distance / len(fingertip_indices)   
-        print(f"Finger landmark position from wrist:{avg_normalized_distance}")
-
-        FIST_THRESHOLD = 4.45
-        OPEN_HAND_THRESHOLD = 1.65
-
-        if avg_normalized_distance < 3.82 and avg_normalized_distance > 3.75:
-            gesture_name = "OPEN"
-        elif avg_normalized_distance < 1.85 and avg_normalized_distance > 1.75:
-            gesture_name = "CLOSE"
-        else: 
-            gesture_name = "UNKNOWN"
-
-        return gesture_name, avg_normalized_distance      
-
-    def _calculate_angle(self, a, b, c):
-        a = (a.x, a.y)
-        b = (b.x, b.y)
-        c = (c.x, c.y)
+        fingers_str = " | ".join([
+            f"{finger[0].upper()}: {'✓' if extended else '✗'}"
+            for finger, extended in finger_states.items()
+        ])
         
-        ba = (a[0] - b[0], a[1] - b[1])
-        bc = (c[0] - b[0], c[1] - b[1])
-        
-        dot_product = ba[0] * bc[0] + ba[1] * bc[1]
-        
-        mag_ba = math.hypot(ba[0], ba[1])
-        mag_bc = math.hypot(bc[0], bc[1])
-        
-        if mag_ba == 0 or mag_bc == 0:
-            return 0.0
-
-        cosine_angle = dot_product / (mag_ba * mag_bc)
-        
-        cosine_angle = max(min(cosine_angle, 1.0), -1.0)
-
-        angle = math.degrees(math.acos(cosine_angle))
-        return angle
+        return f"Extended: {extended_count}/5 | {fingers_str}"
