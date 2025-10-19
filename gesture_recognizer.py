@@ -152,9 +152,13 @@ class GestureRecognizer:
         # TWO FINGERS: Index and middle extended (Victory/Peace sign)
         elif (extended_count == 2 and 
               finger_states['index'] and finger_states['middle']):
-            gesture = "POINTING"  # Treat as pointing for cursor control
+            gesture = "SCROLL"  # Treat as pointing for cursor control
             confidence = 0.9
         
+        elif (extended_count == 2 and finger_states['pinky']):
+            gesture = "COLAPS"
+            confidence = 0.9
+
         # OPEN HAND: 4 or 5 fingers extended
         elif extended_count >= 4:
             gesture = "OPEN"

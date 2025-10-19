@@ -60,13 +60,31 @@ class ComputerController:
         except Exception as e:
             print(f"Right click error: {e}")
     
-    def double_left_click(self):
+    def double_right_click(self):
         """Perform double right click"""
         try:
-            pyautogui.leftClick(_pause=False)
-            pyautogui.leftClick(_pause=False)
+            pyautogui.rightClick(_pause=False)
+            pyautogui.rightClick(_pause=False)
         except Exception as e:
             print(f"Double right click error: {e}")
+    
+    def double_left_click(self):
+        """Perform double left click"""
+        try:
+            pyautogui.doubleClick(_pause=False)
+        except Exception as e:
+            print(f"Double left click error: {e}")
+    
+    def scroll(self, amount):
+        """
+        Scroll the mouse wheel.
+        Positive amount = scroll up
+        Negative amount = scroll down
+        """
+        try:
+            pyautogui.scroll(amount, _pause=False)
+        except Exception as e:
+            print(f"Scroll error: {e}")
     
     def start_drag(self):
         """Start dragging (mouse down)"""
@@ -77,6 +95,14 @@ class ComputerController:
         except Exception as e:
             print(f"Start drag error: {e}")
     
+    def colaps(self):
+        """Closing program"""
+        try:
+            pyautogui.keyDown('alt')
+            pyautogui.press('f4')
+        except Exception as e:
+            print(f"Error closing program {e}")    
+
     def end_drag(self):
         """End dragging (mouse up)"""
         try:
