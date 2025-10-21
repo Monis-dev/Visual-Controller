@@ -1,4 +1,5 @@
 import pyautogui
+import pygetwindow
 import platform
 import time
 
@@ -168,3 +169,16 @@ class ComputerController:
                     pyautogui.keyUp(key, _pause=False)    
                 except Exception:
                     pass    
+    
+    def check_ppt_mode(self):
+        window_type = ".ppt"  
+        try: 
+            active_window = pygetwindow.getActiveWindow()
+            window_title = active_window.title 
+            if window_title == '.ppt':
+                print("PPT detected")
+                return True
+        except:
+            pass
+
+        

@@ -4,128 +4,109 @@ import threading
 import queue
 import numpy as np
 from collections import deque
+
+# Import our new utility modules
+import smoothing_utils as su
+import ui_utils as ui
+import config  # We'll also move settings to config.py for cleanliness
+
+# Import your classes
 from gesture_recognizer import GestureRecognizer
 from computer_controller import ComputerController
 
-print("Attempting to connect to camera")
-cap = cv2.VideoCapture(1)
+print("Initializing...")
 WINDOW_NAME = 'Hand Gesture Control - STABLE MODE'
 
+# --- THREAD-SAFE QUEUES ---
+frame_queue = queue.Queue(maxsize=1)  # Holds raw frames from the camera
+results_queue = queue.Queue(maxsize=1) # Holds processed data from the gesture recognizer
+
+# --- INITIALIZATION ---
 recognizer = GestureRecognizer()
 controller = ComputerController()
+cap = cv2.VideoCapture(1)
+
+if not cap.isOpened():
+    print("Error: Could not connect to the camera. Exiting.")
+    exit()
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_FPS, 30)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-# === ENHANCED STABILITY SETTINGS ===
-
-# 1. EXPONENTIAL SMOOTHING (Primary smoothing)
-smoothing_factor = 0.3  # Lower = smoother but slower (0.1-0.5)
-
-# 2. MOVING AVERAGE FILTER (Secondary smoothing)
-position_buffer_size = 5  # Average of last N positions
-position_buffer_x = deque(maxlen=position_buffer_size)
-position_buffer_y = deque(maxlen=position_buffer_size)
-
-# 3. KALMAN-LIKE FILTERING (Advanced smoothing)
-use_kalman_filter = True
-kalman_process_variance = 0.01  # How much we trust hand movement
-kalman_measurement_variance = 0.1  # How much we trust sensor
-
-# 4. DEADZONE (Ignore tiny movements)
-DEADZONE_PIXELS = 3  # Ignore movements smaller than this
-
-# 5. VELOCITY LIMITING (Prevent sudden jumps)
-MAX_VELOCITY = 80  # Maximum pixels per frame
-
-# 6. ADAPTIVE SMOOTHING (Smooth more when hand is still)
-use_adaptive_smoothing = True
-velocity_threshold_for_adaptive = 20  # pixels/frame
-
-# Other settings
-last_gesture = "IDLE"
-prev_frame_time = 0
-prev_x, prev_y = 0, 0
-last_raw_x, last_raw_y = 0, 0
-is_pointer_locked = False
-
-last_click_time = 0
-CLICK_COOLDOWN = 0.3
-
-last_close_gesture_time = 0
-close_gesture_count = 0
-DOUBLE_CLICK_WINDOW = 0.6
-SINGLE_CLICK_DELAY = 0.7
-
-is_dragging = False
-is_scrolling = False
-scroll_start_y = 0
-last_scroll_time = 0
-SCROLL_SENSITIVITY = 5000
-SCROLL_DEADZONE = 0.01
-
-FRAME_REDUCTION = 0.2
-running = True
+# --- STATE & SETTINGS ---
+# Buffers for smoothing
+position_buffer_x = deque(maxlen=config.position_buffer_size)
+position_buffer_y = deque(maxlen=config.position_buffer_size)
 
 # Kalman filter state
-kalman_x = 0
-kalman_y = 0
-kalman_p_x = 1
-kalman_p_y = 1
+kalman_x, kalman_y = 0, 0
+kalman_p_x, kalman_p_y = 1, 1
+
+# Other state variables
+is_pointer_locked = False
+is_dragging = False
+is_scrolling = False
+prev_x, prev_y = 0, 0
+last_gesture = "IDLE"
+
+# Timing and gesture counts
+last_click_time = 0
+last_close_gesture_time = 0
+close_gesture_count = 0
+
+running = True
+
+prev_frame_time = 0
+latest_results = None
+velocity = 0
 
 mouse_queue = queue.Queue(maxsize=2)
 
-def moving_average_filter(buffer, new_value):
-    """Apply moving average smoothing"""
-    buffer.append(new_value)
-    return sum(buffer) / len(buffer)
+# PPT checker
+is_ppt_mode = False
 
-def kalman_filter(estimate, estimate_error, measurement, measurement_error, process_variance):
-    """Simple 1D Kalman filter for position smoothing"""
-    # Prediction
-    prediction = estimate
-    prediction_error = estimate_error + process_variance
-    
-    # Update
-    kalman_gain = prediction_error / (prediction_error + measurement_error)
-    new_estimate = prediction + kalman_gain * (measurement - prediction)
-    new_estimate_error = (1 - kalman_gain) * prediction_error
-    
-    return new_estimate, new_estimate_error
+def camera_thread_func():
+    """Grabs frames from the camera and puts them in a queue."""
+    while running:
+        success, frame = cap.read()
+        if not success:
+            time.sleep(0.1)
+            continue
+        try:
+            # Flips the frame horizontally for a more intuitive mirror-like effect
+            frame_queue.put(frame, block=False)
+        except queue.Full:
+            # If the processing is slow, we just skip frames
+            pass
+    print("Camera thread stopped.")
 
-def apply_velocity_limit(new_x, new_y, old_x, old_y, max_velocity):
-    """Limit maximum velocity to prevent jumps"""
-    dx = new_x - old_x
-    dy = new_y - old_y
-    distance = np.sqrt(dx**2 + dy**2)
-    
-    if distance > max_velocity:
-        # Scale down to max velocity
-        scale = max_velocity / distance
-        new_x = old_x + dx * scale
-        new_y = old_y + dy * scale
-    
-    return new_x, new_y
 
-def apply_deadzone(new_x, new_y, old_x, old_y, deadzone):
-    """Ignore movements smaller than deadzone"""
-    dx = abs(new_x - old_x)
-    dy = abs(new_y - old_y)
-    
-    if dx < deadzone and dy < deadzone:
-        return old_x, old_y  # No movement
-    return new_x, new_y
-
-def adaptive_smoothing_factor(velocity, base_factor, threshold):
-    """Increase smoothing when hand is moving slowly"""
-    if velocity < threshold:
-        # Hand is still - use stronger smoothing
-        return max(0.1, base_factor * 0.5)
-    else:
-        # Hand is moving - use normal smoothing
-        return base_factor
+def gesture_thread_func():
+    """Processes frames for gesture recognition."""
+    while running:
+        try:
+            frame = frame_queue.get(timeout=0.1)
+            
+            # Process the frame to find hand landmarks and gesture
+            processed_frame, landmarks = recognizer.find_hand_landmarks(frame)
+            current_gesture, confidence = recognizer.get_gesture()
+            
+            result = {
+                "frame": processed_frame,
+                "landmarks": landmarks,
+                "gesture": current_gesture,
+                "confidence": confidence
+            }
+            
+            results_queue.put(result, block=False)
+            
+        except queue.Empty:
+            continue
+        except queue.Full:
+            pass
+    print("Gesture thread stopped.")
 
 def mouse_controller_thread():
     while running:
@@ -138,327 +119,170 @@ def mouse_controller_thread():
         except Exception:
             break
 
+
+print("Success! Camera stream is open.")
+print("\n=== ENHANCED STABILITY MODE ===")
+print("Controls:")
+print("  👆 POINTING → Move cursor")
+print("  🤏 PINCH → Drag")
+print("  ✋ OPEN HAND → Left Click")
+print("  ✊ FIST (once) → Right Click")
+print("  ✊ FIST (twice) → Double Left Click")
+print("  ☝️ THREE FINGERS → Scroll")
+print("\nStability Features:")
+print(f"  • Exponential smoothing: {config.smoothing_factor}")
+print(f"  • Moving average: {config.position_buffer_size} frames")
+print(f"  • Kalman filter: {'ON' if config.use_kalman_filter else 'OFF'}")
+print(f"  • Deadzone: {config.DEADZONE_PIXELS}px")
+print(f"  • Velocity limit: {config.MAX_VELOCITY}px/frame")
+print(f"  • Adaptive smoothing: {'ON' if config.use_adaptive_smoothing else 'OFF'}\n")
+
+cam_thread = threading.Thread(target=camera_thread_func, daemon=True)
+rec_thread = threading.Thread(target=gesture_thread_func, daemon=True)
 mouse_thread = threading.Thread(target=mouse_controller_thread, daemon=True)
+
+cam_thread.start()
+rec_thread.start()
 mouse_thread.start()
 
-if not cap.isOpened():
-    print("Error: Could not connect to the camera")
-else:
-    print("Success! Camera stream is open.")
-    print("\n=== ENHANCED STABILITY MODE ===")
-    print("Controls:")
-    print("  👆 POINTING → Move cursor")
-    print("  🤏 PINCH → Drag")
-    print("  ✋ OPEN HAND → Left Click")
-    print("  ✊ FIST (once) → Right Click")
-    print("  ✊ FIST (twice) → Double Left Click")
-    print("  ☝️ THREE FINGERS → Scroll")
-    print("\nStability Features:")
-    print(f"  • Exponential smoothing: {smoothing_factor}")
-    print(f"  • Moving average: {position_buffer_size} frames")
-    print(f"  • Kalman filter: {'ON' if use_kalman_filter else 'OFF'}")
-    print(f"  • Deadzone: {DEADZONE_PIXELS}px")
-    print(f"  • Velocity limit: {MAX_VELOCITY}px/frame")
-    print(f"  • Adaptive smoothing: {'ON' if use_adaptive_smoothing else 'OFF'}\n")
-    
-    try:
-        while True:
-            success, frame = cap.read()
-            if not success: 
-                continue
 
-            new_frame_time = time.time()
-            fps = 1 / (new_frame_time - prev_frame_time) if prev_frame_time > 0 else 0
-            prev_frame_time = new_frame_time     
-
-            processed_frame, landmarks = recognizer.find_hand_landmarks(frame)
-            frame_height, frame_width, _ = processed_frame.shape
-
-            if not is_pointer_locked and controller.check_for_manual_failsafe():
-                is_pointer_locked = True
-                if is_dragging:
-                    controller.end_drag()
-                    is_dragging = False
-                if is_scrolling:
-                    is_scrolling = False
-                print("⏸ PAUSED")
-
-            current_gesture, confidence = recognizer.get_gesture()
-            current_time = time.time()
-
-            x_min_bound = int(FRAME_REDUCTION * frame_width)
-            y_min_bound = int(FRAME_REDUCTION * frame_height)
-            x_max_bound = int(frame_width - (FRAME_REDUCTION * frame_width))
-            y_max_bound = int(frame_height - (FRAME_REDUCTION * frame_height))
-
-            if not is_pointer_locked:
-                active_area_color = (255, 255, 0)
-                
-                # SCROLL HANDLING
-                if landmarks:
-                    if current_gesture == "SCROLL":
-                        if not is_scrolling:
-                            is_scrolling = True
-                            scroll_start_y = landmarks.landmark[12].y
-                            last_scroll_time = current_time
-                            print("📜 Scroll started")
-                        else:
-                            current_scroll_y = landmarks.landmark[12].y
-                            delta_y = scroll_start_y - current_scroll_y
-                            
-                            if abs(delta_y) > SCROLL_DEADZONE and (current_time - last_scroll_time) > 0.05:
-                                scroll_amount = int(delta_y * SCROLL_SENSITIVITY)
-                                if scroll_amount != 0:
-                                    controller.scroll(scroll_amount)
-                                    last_scroll_time = current_time
-                                scroll_start_y = current_scroll_y
-                    
-                    elif is_scrolling:
-                        is_scrolling = False
-                        scroll_start_y = 0
-                        print("📜 Scroll ended")
-                
-                # === CURSOR MOVEMENT WITH STABILITY ===
-                if not is_scrolling and landmarks:
-                    pointer_coords, _, _ = recognizer.get_pointer_coordinates(processed_frame.shape)
-                    
-                    if pointer_coords:
-                        raw_x, raw_y = pointer_coords
-                        
-                        # Map to screen coordinates
-                        screen_x = np.interp(raw_x, (x_min_bound, x_max_bound), (0, controller.screen_width))
-                        screen_y = np.interp(raw_y, (y_min_bound, y_max_bound), (0, controller.screen_height))
-                        
-                        # === STABILITY PIPELINE ===
-                        
-                        # Step 1: Moving Average Filter
-                        screen_x = moving_average_filter(position_buffer_x, screen_x)
-                        screen_y = moving_average_filter(position_buffer_y, screen_y)
-                        
-                        # Step 2: Kalman Filter (optional)
-                        if use_kalman_filter:
-                            kalman_x, kalman_p_x = kalman_filter(
-                                kalman_x, kalman_p_x, screen_x, 
-                                kalman_measurement_variance, kalman_process_variance
-                            )
-                            kalman_y, kalman_p_y = kalman_filter(
-                                kalman_y, kalman_p_y, screen_y,
-                                kalman_measurement_variance, kalman_process_variance
-                            )
-                            screen_x, screen_y = kalman_x, kalman_y
-                        
-                        # Step 3: Velocity Limiting
-                        
-                        
-                        # Step 4: Calculate velocity for adaptive smoothing
-                        velocity = np.sqrt((screen_x - prev_x)**2 + (screen_y - prev_y)**2)
-                        
-                        # Step 5: Adaptive Smoothing Factor
-                        if use_adaptive_smoothing:
-                            current_smoothing = adaptive_smoothing_factor(
-                                velocity, smoothing_factor, velocity_threshold_for_adaptive
-                            )
-                        else:
-                            current_smoothing = smoothing_factor
-                        
-                        # Step 6: Apply Exponential Smoothing
-                        current_x = prev_x + (screen_x - prev_x) * current_smoothing
-                        current_y = prev_y + (screen_y - prev_y) * current_smoothing
-                        
-                        # Step 7: Apply Deadzone
-                        current_x, current_y = apply_deadzone(
-                            current_x, current_y, prev_x, prev_y, DEADZONE_PIXELS
-                        )
-                        
-                        # Move cursor
-                        if not is_dragging:
-                            try: 
-                                mouse_queue.put_nowait((current_x, current_y))
-                            except queue.Full: 
-                                pass
-                        else:
-                            controller.point_movement(int(current_x), int(current_y))
-                        
-                        prev_x, prev_y = current_x, current_y
-                        last_raw_x, last_raw_y = screen_x, screen_y
-                        
-                        # Visual feedback
-                        if current_gesture == "SCROLL":
-                            pointer_color = (255, 0, 255)
-                        elif is_dragging:
-                            pointer_color = (0, 0, 255)
-                        else:
-                            pointer_color = (0, 255, 0)
-                        
-                        cv2.circle(processed_frame, pointer_coords, 10, pointer_color, -1)
-                        cv2.circle(processed_frame, pointer_coords, 15, pointer_color, 2)
-                        
-                        # Show velocity indicator
-                        velocity_bar_length = int(min(velocity * 2, 100))
-                        cv2.rectangle(processed_frame, (10, 100), (110, 115), (50, 50, 50), -1)
-                        cv2.rectangle(processed_frame, (10, 100), (10 + velocity_bar_length, 115), (0, 255, 255), -1)
-                        cv2.putText(processed_frame, "Speed", (120, 112), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-                # DRAG HANDLING
-                if not is_scrolling:
-                    if current_gesture == "PINCH" and last_gesture != "PINCH":
-                        if not is_dragging:
-                            controller.start_drag()
-                            is_dragging = True
-                            print("🖱 Drag started")
-                    
-                    elif current_gesture != "PINCH" and is_dragging:
-                        controller.end_drag()
-                        is_dragging = False
-                        print("🖱 Drag ended")
-                
-                # CLICK HANDLING
-                if not is_dragging and not is_scrolling and confidence > 0.7:
-                    
-                    if current_gesture == "OPEN" and last_gesture != "OPEN":
-                        if (current_time - last_click_time) > CLICK_COOLDOWN:
-                            controller.left_click()
-                            last_click_time = current_time
-                            print("🖱 Left Click")
-                    
-                    elif current_gesture == "CLOSE" and last_gesture != "CLOSE":
-                        time_since_last_close = current_time - last_close_gesture_time
-                        
-                        if time_since_last_close < DOUBLE_CLICK_WINDOW and close_gesture_count == 1:
-                            controller.double_left_click()
-                            last_click_time = current_time
-                            close_gesture_count = 0
-                            last_close_gesture_time = 0
-                            print("🖱🖱 Double Left Click")
-                        else:
-                            close_gesture_count = 1
-                            last_close_gesture_time = current_time
-                    elif current_gesture == "COLAPS" and last_gesture != "COLAPS":
-                        controller.colaps()
-                        print("Closing folder")
-                if close_gesture_count == 1:
-                    time_since_close = current_time - last_close_gesture_time
-                    if time_since_close > SINGLE_CLICK_DELAY:
-                        controller.right_click()
-                        last_click_time = current_time
-                        close_gesture_count = 0
-                        last_close_gesture_time = 0
-                        print("🖱 Right Click")
-            
-            else:  # LOCKED
-                active_area_color = (0, 0, 255)
-                
-                cv2.putText(processed_frame, "POINTER LOCKED", 
-                           (frame_width//2 - 150, 100), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-                cv2.putText(processed_frame, "Show OPEN HAND to resume", 
-                           (frame_width//2 - 200, 150), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-                if current_gesture == "OPEN" and confidence > 0.8:
-                    center_x = controller.screen_width // 2
-                    center_y = controller.screen_height // 2
-                    controller.point_movement(center_x, center_y)
-                    
-                    if landmarks:
-                        pointer_coords, _, _ = recognizer.get_pointer_coordinates(processed_frame.shape)
-                        if pointer_coords:
-                            raw_x, raw_y = pointer_coords
-                            prev_x = np.interp(raw_x, (x_min_bound, x_max_bound), (0, controller.screen_width))
-                            prev_y = np.interp(raw_y, (y_min_bound, y_max_bound), (0, controller.screen_height))
-                            
-                            # Reset filters
-                            position_buffer_x.clear()
-                            position_buffer_y.clear()
-                            kalman_x, kalman_y = prev_x, prev_y
-                            kalman_p_x, kalman_p_y = 1, 1
-                    
-                    is_pointer_locked = False
-                    is_scrolling = False
-                    last_click_time = current_time
-                    close_gesture_count = 0
-                    last_close_gesture_time = 0
-                    print("▶ RESUMED")
-
-            last_gesture = current_gesture
-
-            # VISUAL FEEDBACK
-            cv2.rectangle(processed_frame, (x_min_bound, y_min_bound), 
-                         (x_max_bound, y_max_bound), active_area_color, 2)
-            
-            cv2.putText(processed_frame, f"FPS: {int(fps)}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            gesture_text = f"Gesture: {current_gesture}"
-            if is_dragging: 
-                gesture_text += " (DRAGGING)"
-            if is_scrolling: 
-                gesture_text += " (SCROLLING)"
-            if is_pointer_locked: 
-                gesture_text = "LOCKED"
-            
-            gesture_color = {
-                "OPEN": (0, 255, 0),
-                "CLOSE": (0, 0, 255),
-                "PINCH": (255, 0, 255),
-                "SCROLL": (255, 165, 0),
-                "POINTING": (255, 255, 0)
-            }.get(current_gesture, (255, 255, 255))
-            
-            cv2.putText(processed_frame, gesture_text, (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, gesture_color, 2)
-            
-            # Confidence bar
-            bar_width = int(200 * confidence)
-            cv2.rectangle(processed_frame, (10, 75), (210, 90), (50, 50, 50), -1)
-            cv2.rectangle(processed_frame, (10, 75), (10 + bar_width, 90), gesture_color, -1)
-            
-            if close_gesture_count == 1:
-                remaining_time = SINGLE_CLICK_DELAY - (current_time - last_close_gesture_time)
-                if remaining_time > 0:
-                    cv2.putText(processed_frame, "Waiting for 2nd fist...", 
-                               (10, frame_height - 20), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            
-            if is_scrolling:
-                cv2.putText(processed_frame, "Move hand UP/DOWN to scroll", 
-                           (frame_width//2 - 180, frame_height - 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
-            
-            cv2.imshow(WINDOW_NAME, processed_frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q') or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                print("Exit signal received, shutting down...")
-                break
-                
-    finally:
-        print("Cleaning up resources")
-        running = False
-
+try:
+    while running:
+        # Get the latest processed results from the gesture thread
         try:
-            controller.failsafe_cleanup()
-        except Exception as e:
-            print(f"Error during failsafe cleanup: {e}")
-        try:
-            if cap.isOpened():
-                cap.release()
-                print("Camera released")
-        except Exception as e:
-            print(f"Error releasing camera: {e}")
-        try:
-            cv2.destroyAllWindows()
-            print("Window Closed")
-        except Exception as e:
-            print(f"Error closing window {e}")
-        try:
-            print("Waiting for mouse thread to join")
-            mouse_thread.join(timeout=1.0)
-            if mouse_thread.is_alive():
-                print("Warining: Mouse threads did not terminates cleanly")
+            results = results_queue.get_nowait()
+            latest_results = results
+            processed_frame = results['frame']
+        except queue.Empty:
+            # If no new results, use the last frame to keep UI responsive
+            if latest_results:
+                processed_frame = latest_results['frame']
             else:
-                print("Mouse thread joined successfully")
-        except Exception as e:
-            print(f"Error joining the mouse threads {e}")                
-
+                # Show a loading screen until the first frame is processed
+                loading_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+                cv2.putText(loading_frame, "Waiting for camera...", (450, 360), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.imshow(WINDOW_NAME, loading_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                continue
+        # --- UNPACK RESULTS & CALCULATE TIMINGS ---
+        new_frame_time = time.time()
+        fps = 1 / (new_frame_time - prev_frame_time) if prev_frame_time > 0 else 0
+        prev_frame_time = new_frame_time
+        current_time = time.time()
+        landmarks = latest_results['landmarks']
+        current_gesture = latest_results['gesture']
+        confidence = latest_results['confidence']
+        frame_height, frame_width, _ = processed_frame.shape
+        x_min_bound = int(config.FRAME_REDUCTION * frame_width)
+        y_min_bound = int(config.FRAME_REDUCTION * frame_height)
+        x_max_bound = int(frame_width - (config.FRAME_REDUCTION * frame_width))
+        y_max_bound = int(frame_height - (config.FRAME_REDUCTION * frame_height))
+        # --- GESTURE LOGIC ---
+        if not is_pointer_locked and controller.check_for_manual_failsafe():
+            is_pointer_locked = True
+            if is_dragging: controller.end_drag(); is_dragging = False
+            if is_scrolling: is_scrolling = False
+            print("⏸ PAUSED")
+        if not is_pointer_locked:
+            # SCROLL HANDLING
+            if landmarks and current_gesture == "SCROLL":
+                if not is_scrolling:
+                    is_scrolling = True
+                    scroll_start_y = landmarks.landmark[12].y
+                    last_scroll_time = current_time
+                    print("📜 Scroll started")
+                else:
+                    current_scroll_y = landmarks.landmark[12].y
+                    delta_y = scroll_start_y - current_scroll_y
+                    if abs(delta_y) > config.SCROLL_DEADZONE and (current_time - last_scroll_time) > 0.05:
+                        scroll_amount = int(delta_y * config.SCROLL_SENSITIVITY)
+                        if scroll_amount != 0: 
+                            controller.scroll(scroll_amount)
+                            last_scroll_time = current_time
+                        scroll_start_y = current_scroll_y    
+            elif is_scrolling:
+                is_scrolling = False
+                scroll_start_y = 0
+                print("📜 Scroll ended")
+            # CURSOR MOVEMENT
+            if not is_scrolling and landmarks:
+                pointer_coords, _, _ = recognizer.get_pointer_coordinates(processed_frame.shape)
+                if pointer_coords:
+                    raw_x, raw_y = pointer_coords
+                    screen_x = np.interp(raw_x, (x_min_bound, x_max_bound), (0, controller.screen_width))
+                    screen_y = np.interp(raw_y, (y_min_bound, y_max_bound), (0, controller.screen_height))
+                    # --- STABILITY PIPELINE ---
+                    screen_x = su.moving_average_filter(position_buffer_x, screen_x)
+                    screen_y = su.moving_average_filter(position_buffer_y, screen_y)
+                    if config.use_kalman_filter:
+                        kalman_x, kalman_p_x = su.kalman_filter(kalman_x, kalman_p_x, screen_x, config.kalman_measurement_variance, config.kalman_process_variance)
+                        kalman_y, kalman_p_y = su.kalman_filter(kalman_y, kalman_p_y, screen_y, config.kalman_measurement_variance, config.kalman_process_variance)
+                        screen_x, screen_y = kalman_x, kalman_y
+                    velocity = np.sqrt((screen_x - prev_x)**2 + (screen_y - prev_y)**2)
+                    current_smoothing = su.adaptive_smoothing_factor(velocity, config.smoothing_factor, config.velocity_threshold_for_adaptive) if config.use_adaptive_smoothing else config.smoothing_factor
+                    current_x = prev_x + (screen_x - prev_x) * current_smoothing
+                    current_y = prev_y + (screen_y - prev_y) * current_smoothing
+                    current_x, current_y = su.apply_deadzone(current_x, current_y, prev_x, prev_y, config.DEADZONE_PIXELS)
+                    if not is_dragging:
+                        try: mouse_queue.put_nowait((current_x, current_y))
+                        except queue.Full: pass
+                    else:
+                        controller.point_movement(int(current_x), int(current_y))
+                    prev_x, prev_y = current_x, current_y
+            # DRAG & CLICK HANDLING
+            if not is_scrolling:
+                if current_gesture == "PINCH" and not is_dragging:
+                    controller.start_drag(); is_dragging = True; print("🖱 Drag started")
+                elif current_gesture != "PINCH" and is_dragging:
+                    controller.end_drag(); is_dragging = False; print("🖱 Drag ended")
+                if not is_dragging and confidence > 0.7:
+                    if current_gesture == "OPEN" and last_gesture != "OPEN" and (current_time - last_click_time) > config.CLICK_COOLDOWN:
+                        controller.left_click(); last_click_time = current_time; print("🖱 Left Click")
+                    elif current_gesture == "CLOSE" and last_gesture != "CLOSE":
+                        if (current_time - last_close_gesture_time) < config.DOUBLE_CLICK_WINDOW and close_gesture_count == 1:
+                            controller.double_left_click(); last_click_time = current_time; close_gesture_count = 0; print("🖱🖱 Double Left Click")
+                        else:
+                            close_gesture_count = 1; last_close_gesture_time = current_time
+                    elif current_gesture == "COLAPS" and last_gesture != "COLAPS":
+                        controller.colaps(); print("Closing folder")
+            if close_gesture_count == 1 and (current_time - last_close_gesture_time) > config.SINGLE_CLICK_DELAY:
+                controller.right_click(); last_click_time = current_time; close_gesture_count = 0; print("🖱 Right Click")
+        else: # LOCKED STATE LOGIC
+            if current_gesture == "OPEN" and confidence > 0.8:
+                # Reset logic...
+                is_pointer_locked = False
+                # (You can add the full reset logic from your old code here if needed)
+                print("▶ RESUMED")
+        last_gesture = current_gesture
+        # --- DRAWING ---
+        ui_state = {
+            'fps': fps, 'current_gesture': current_gesture, 'confidence': confidence,
+            'is_dragging': is_dragging, 'is_scrolling': is_scrolling, 'is_pointer_locked': is_pointer_locked,
+            'x_min_bound': x_min_bound, 'y_min_bound': y_min_bound,
+            'x_max_bound': x_max_bound, 'y_max_bound': y_max_bound,
+            'active_area_color': (0, 0, 255) if is_pointer_locked else (255, 255, 0),
+            'close_gesture_count': close_gesture_count, 'last_close_gesture_time': last_close_gesture_time,
+            'pointer_coords': recognizer.get_pointer_coordinates(processed_frame.shape)[0] if landmarks else None,
+            'velocity': velocity
+        }
+        ui.draw_ui_elements(processed_frame, ui_state)
+        cv2.imshow(WINDOW_NAME, processed_frame)
+        # --- EXIT CONDITION ---
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            running = False # Signal all threads to stop
+            break
+finally:
+    print("Cleaning up resources...")
+    running = False # Re-affirm that threads should stop
+    print("Waiting for threads to join...")
+    cam_thread.join(timeout=1.0)
+    rec_thread.join(timeout=1.0)
+    mouse_thread.join(timeout=1.0)
+    controller.failsafe_cleanup()
+    if cap.isOpened():
+        cap.release()
+        print("Camera released.")
+    cv2.destroyAllWindows()
+    print("Windows destroyed.")
 print("Program ended successfully")

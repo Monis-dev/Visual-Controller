@@ -1,6 +1,7 @@
 # ui_utils.py
 import cv2
 import time
+import config
 
 def draw_ui_elements(frame, state):
     """Draws all UI elements onto the frame based on the current state."""
