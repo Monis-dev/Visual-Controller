@@ -1,5 +1,6 @@
 import pyautogui
 import platform
+import time
 
 class ComputerController:
     def __init__(self):
@@ -86,6 +87,13 @@ class ComputerController:
         except Exception as e:
             print(f"Scroll error: {e}")
     
+    def colaps(self):
+        """Closing program"""
+        try:
+            pyautogui.hotkey('alt', 'f4', _pause=False)
+        except Exception as e:
+            print(f"Error closing program {e}")    
+
     def start_drag(self):
         """Start dragging (mouse down)"""
         try:
@@ -95,14 +103,6 @@ class ComputerController:
         except Exception as e:
             print(f"Start drag error: {e}")
     
-    def colaps(self):
-        """Closing program"""
-        try:
-            pyautogui.keyDown('alt')
-            pyautogui.press('f4')
-        except Exception as e:
-            print(f"Error closing program {e}")    
-
     def end_drag(self):
         """End dragging (mouse up)"""
         try:
@@ -118,7 +118,6 @@ class ComputerController:
         This replaces PyAutoGUI's automatic failsafe.
         Returns True if cursor is in a corner.
         """
-        import time
         
         # Throttle checks for performance
         current_time = time.time()
@@ -150,3 +149,22 @@ class ComputerController:
             return pyautogui.position()
         except:
             return (0, 0)
+        
+
+    def failsafe_cleanup(self):
+        """Release all the mouse button and common modifier keys"""
+        print("Running failsafe cleanup: Releasing all keys and buttons.")
+
+        if self.is_dragging:
+            self.end_drag()
+
+        for button in ['left', 'right', 'middle']:
+            try:
+                pyautogui.mouseUp(button=button, _pause=False)
+            except Exception:
+                pass 
+            for key in ['ctrl', 'shift', 'alt', 'win']:
+                try:
+                    pyautogui.keyUp(key, _pause=False)    
+                except Exception:
+                    pass    

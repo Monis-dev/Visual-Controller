@@ -9,6 +9,7 @@ from computer_controller import ComputerController
 
 print("Attempting to connect to camera")
 cap = cv2.VideoCapture(1)
+WINDOW_NAME = 'Hand Gesture Control - STABLE MODE'
 
 recognizer = GestureRecognizer()
 controller = ComputerController()
@@ -62,7 +63,7 @@ is_dragging = False
 is_scrolling = False
 scroll_start_y = 0
 last_scroll_time = 0
-SCROLL_SENSITIVITY = 30
+SCROLL_SENSITIVITY = 5000
 SCROLL_DEADZONE = 0.01
 
 FRAME_REDUCTION = 0.2
@@ -247,9 +248,7 @@ else:
                             screen_x, screen_y = kalman_x, kalman_y
                         
                         # Step 3: Velocity Limiting
-                        screen_x, screen_y = apply_velocity_limit(
-                            screen_x, screen_y, prev_x, prev_y, MAX_VELOCITY
-                        )
+                        
                         
                         # Step 4: Calculate velocity for adaptive smoothing
                         velocity = np.sqrt((screen_x - prev_x)**2 + (screen_y - prev_y)**2)
@@ -427,17 +426,39 @@ else:
                            (frame_width//2 - 180, frame_height - 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
             
-            cv2.imshow('Hand Gesture Control - STABLE MODE', processed_frame)
+            cv2.imshow(WINDOW_NAME, processed_frame)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord('q') or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                print("Exit signal received, shutting down...")
                 break
                 
     finally:
-        if is_dragging: 
-            controller.end_drag()
+        print("Cleaning up resources")
         running = False
-        cap.release()
-        cv2.destroyAllWindows()
-        mouse_thread.join(timeout=1.0)
+
+        try:
+            controller.failsafe_cleanup()
+        except Exception as e:
+            print(f"Error during failsafe cleanup: {e}")
+        try:
+            if cap.isOpened():
+                cap.release()
+                print("Camera released")
+        except Exception as e:
+            print(f"Error releasing camera: {e}")
+        try:
+            cv2.destroyAllWindows()
+            print("Window Closed")
+        except Exception as e:
+            print(f"Error closing window {e}")
+        try:
+            print("Waiting for mouse thread to join")
+            mouse_thread.join(timeout=1.0)
+            if mouse_thread.is_alive():
+                print("Warining: Mouse threads did not terminates cleanly")
+            else:
+                print("Mouse thread joined successfully")
+        except Exception as e:
+            print(f"Error joining the mouse threads {e}")                
 
 print("Program ended successfully")
