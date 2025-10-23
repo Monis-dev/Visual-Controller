@@ -8,35 +8,49 @@ class GestureRecognizer:
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
+            max_num_hands=2,
             min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
+            min_tracking_confidence=0.5,
             model_complexity=0
         )
         self.mp_drawing = mp.solutions.drawing_utils
         self.landmarks = None
         
         # Gesture smoothing with deque for better performance
-        self.gesture_buffer = deque(maxlen=7)
+        self.gesture_buffer = deque(maxlen=5)
         self.last_stable_gesture = "IDLE"
 
     def find_hand_landmarks(self, frame):
         self.landmarks = None
+        self.active_hand_type = None
         
         frame = cv2.flip(frame, 1)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb_frame)
 
         if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            self.landmarks = hand_landmarks
-            self.mp_drawing.draw_landmarks(
-                frame,
-                hand_landmarks,
-                self.mp_hands.HAND_CONNECTIONS
-            )    
+            left_hand_landmarks,  right_hand_landmarks = None, None
 
-        return frame, self.landmarks
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                hand_type = handedness.classification[0].label
+                if hand_type == "Left":
+                    left_hand_landmarks = hand_landmarks
+                elif hand_type == "Right":
+                    right_hand_landmarks = hand_landmarks
+            if left_hand_landmarks:
+                self.landmarks = left_hand_landmarks
+                self.active_hand_type = 'Left'
+            elif right_hand_landmarks:
+                self.landmarks = right_hand_landmarks
+                self.active_hand_type = "Right"  
+            if self.landmarks:
+                self.mp_drawing.draw_landmarks(
+                    frame,
+                    self.landmarks,
+                    self.mp_hands.HAND_CONNECTIONS
+                )    
+
+        return frame, self.landmarks, self.active_hand_type
     
     def _get_distance(self, point1, point2):
         """Calculate Euclidean distance between two points"""
@@ -130,45 +144,55 @@ class GestureRecognizer:
         # A smaller value means the fingers must be closer.
         pinch_threshold = 0.045
 
+
+        if self.active_hand_type == "Right":
         # Condition: Thumb and index are close, and other fingers are not fully extended
-        if (pinch_distance < pinch_threshold and 
-            not finger_states['middle'] and 
-            not finger_states['ring'] and 
-            not finger_states['pinky']):
-            gesture = "PINCH"
-            # Confidence is higher the closer the pinch
-            confidence = max(0.0, 1.0 - (pinch_distance / pinch_threshold))
+            if (pinch_distance < pinch_threshold and 
+                not finger_states['middle'] and 
+                not finger_states['ring'] and 
+                not finger_states['pinky']):
+                gesture = "PINCH"
+                # Confidence is higher the closer the pinch
+                confidence = max(0.0, 1.0 - (pinch_distance / pinch_threshold))
 
-        # FIST / CLOSE: All fingers curled
-        elif extended_count == 0:
-            gesture = "CLOSE"
-            confidence = 1.0
-        
-        # ONE FINGER (INDEX POINTING): Only index extended
-        elif extended_count == 1 and finger_states['index']:
-            gesture = "POINTING"
-            confidence = 1.0
-        
-        # TWO FINGERS: Index and middle extended (Victory/Peace sign)
-        elif (extended_count == 2 and 
-              finger_states['index'] and finger_states['middle']):
-            gesture = "SCROLL"  # Treat as pointing for cursor control
-            confidence = 0.9
-        
-        elif (extended_count == 2 and finger_states['pinky']):
-            gesture = "COLAPS"
-            confidence = 0.9
+            # FIST / CLOSE: All fingers curled
+            elif extended_count == 0:
+                gesture = "CLOSE"
+                confidence = 1.0
 
-        # OPEN HAND: 4 or 5 fingers extended
-        elif extended_count >= 4:
-            gesture = "OPEN"
-            confidence = extended_count / 5.0
-        
-        # --- Other cases fall back to IDLE ---
-        else:
-            gesture = "IDLE"
-            confidence = 0.4 # Default low confidence
-        
+            # ONE FINGER (INDEX POINTING): Only index extended
+            elif extended_count == 1 and finger_states['index']:
+                gesture = "POINTING"
+                confidence = 1.0
+
+            # TWO FINGERS: Index and middle extended (Victory/Peace sign)
+            elif (extended_count == 2 and 
+                  finger_states['index'] and finger_states['middle']):
+                gesture = "SCROLL"  # Treat as pointing for cursor control
+                confidence = 0.9
+
+            elif (extended_count == 2 and finger_states['pinky']):
+                gesture = "COLAPS"
+                confidence = 0.9
+
+            # OPEN HAND: 4 or 5 fingers extended
+            elif extended_count >= 4:
+                gesture = "OPEN"
+                confidence = extended_count / 5.0
+
+            # --- Other cases fall back to IDLE ---
+            else:
+                gesture = "IDLE"
+                confidence = 0.4 # Default low confidence
+
+        elif self.active_hand_type == "Left":
+            if extended_count == 0:
+                gesture = "CLOSE"
+                confidence = 1.0
+            
+            elif extended_count == 1 and finger_states["index"]:
+                gesture = "PPT"
+                confidence = 1.0     
         # Add to buffer for temporal smoothing
         self.gesture_buffer.append(gesture)
         

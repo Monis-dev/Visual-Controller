@@ -18,9 +18,9 @@ class ComputerController:
                 import ctypes
                 self.user32 = ctypes.windll.user32
                 self.use_ctypes = True
-                print("✓ Using ctypes for faster mouse control on Windows")
+                print("Using ctypes for faster mouse control on Windows")
             except:
-                print("⚠ ctypes not available, using pyautogui")
+                print("ctypes not available, using pyautogui")
         
         # For drag functionality
         self.is_dragging = False
@@ -88,6 +88,31 @@ class ComputerController:
         except Exception as e:
             print(f"Scroll error: {e}")
     
+    def right_slide(self):
+        try:
+            pyautogui.press("right", _pause=False)
+        except Exception as e:
+            print(f"Error performing right button {e}")    
+
+    def left_slide(self):
+        try:
+            pyautogui.press("left", _pause=False)
+        except Exception as e:
+            print(f"Error performing right button {e}")    
+
+    def start_slide(self):
+        try:
+            pyautogui.press("f5", _pause=False)
+        except Exception as e:
+            print(f"Error performing right button {e}")    
+
+    def close_slide(self):
+        try:
+            pyautogui.press("escape", _pause=False)
+        except Exception as e:
+            print(f"Error performing right button {e}")    
+
+
     def colaps(self):
         """Closing program"""
         try:
